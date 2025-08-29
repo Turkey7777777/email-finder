@@ -12,14 +12,14 @@ import dns.resolver
 import smtplib
 from email.utils import parseaddr
 
-# --- Config ---
-CRAWL_TIMEOUT = 15  # seconds per page
+# Config
+CRAWL_TIMEOUT = 15
 PER_DOMAIN_PAGE_LIMIT = 5
-GLOBAL_REQUESTS_PER_MINUTE = 60  # polite limit
+GLOBAL_REQUESTS_PER_MINUTE = 60
 USER_AGENT = "MinpackEmailFinder/1.0 (+https://www.minpack.com)"
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 
-# --- Simple rate limiter ---
+# Simple rate limiter
 _last_reset = time.time()
 _tokens = GLOBAL_REQUESTS_PER_MINUTE
 def rate_limit():
@@ -36,7 +36,7 @@ def rate_limit():
             _tokens = GLOBAL_REQUESTS_PER_MINUTE
     _tokens -= 1
 
-# --- Helpers ---
+# HTTP helpers
 async def fetch(client: httpx.AsyncClient, url: str) -> str:
     rate_limit()
     try:
@@ -144,7 +144,7 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
         for e in extract_emails(html):
             if not looks_junky(e):
                 emails.add(e)
-        for href in re.findall(r'href=["\'](.*?)["\']', html, re.I):
+        for href in re.findall(r'href=[\"\'](.*?)[\"\']', html, re.I):
             href_abs = urljoin(url, href)
             p = urlparse(href_abs)
             if p.netloc == urlparse(base_url).netloc:
@@ -152,50 +152,44 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
                     queue.append(href_abs)
     return emails
 
-# --- Robust CSV handling ---
+# Robust CSV handling
 def read_csv_simple(file):
-    # Read bytes and decode while stripping UTF-8 BOM if present
-    raw = file.read().decode("utf-8-sig", errors="ignore")
+    # Read bytes, strip BOM, normalize newlines
+    raw = file.read()
+    text = raw.decode("utf-8-sig", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
 
-    # Detect delimiter from the first ~2KB, fallback to comma
-    try:
-        dialect = csv.Sniffer().sniff(raw[:2048])
-        delim = dialect.delimiter
-    except Exception:
-        delim = ","
-
-    rdr = csv.reader(io.StringIO(raw), delimiter=delim)
-    rows_list = list(rdr)
-    if not rows_list:
+    if not text:
         return [], set()
 
-    # Normalize header or synthesize if missing
-    header = [h.strip().strip('"\'' ).lower() for h in rows_list[0]]
-    canonical_any = {"email", "emails", "e-mail", "mail", "domain", "website", "site", "url", "link", "page"}
-    if not any(h in canonical_any for h in header):
-        # No recognizable header, treat first row as data and synthesize col names
-        header = [f"col{i+1}" for i in range(len(rows_list[0]))]
-        data_rows = rows_list
-    else:
-        data_rows = rows_list[1:]
+    # Try DictReader with common delimiters
+    delimiters = [",", ";", "\t", "|"]
+    for delim in delimiters:
+        try:
+            rdr = csv.DictReader(io.StringIO(text), delimiter=delim)
+            if rdr.fieldnames and any(h is not None for h in rdr.fieldnames):
+                rows_list = list(rdr)
+                norm_rows = []
+                for r in rows_list:
+                    d = {}
+                    for k, v in r.items():
+                        key = (k or "").strip().lower()
+                        if key in {"emails", "e-mail", "mail"}:
+                            key = "email"
+                        if key in {"website", "site"}:
+                            key = "website"
+                        if key in {"link", "page"}:
+                            key = "url"
+                        d[key] = (v or "").strip()
+                    norm_rows.append(d)
+                cols = set(norm_rows[0].keys()) if norm_rows else set()
+                return norm_rows, cols
+        except Exception:
+            continue
 
-    # Build dict rows and normalize keys to canonical names
-    norm_rows = []
-    for r in data_rows:
-        d = {}
-        for k, v in zip(header, r):
-            key = k.strip().lower()
-            if key in {"emails", "e-mail", "mail"}:
-                key = "email"
-            if key in {"website", "site"}:
-                key = "website"
-            if key in {"link", "page"}:
-                key = "url"
-            d[key] = (v or "").strip()
-        norm_rows.append(d)
-
-    cols = set(norm_rows[0].keys()) if norm_rows else set()
-    return norm_rows, cols
+    # Fallback to single-column list with no header
+    lines = [ln.strip() for ln in text.split("\n")]
+    rows = [{"email": ln} for ln in lines if ln]
+    return rows, {"email"}
 
 def dedupe_rows(rows: list[dict], key: str) -> list[dict]:
     seen = set()
@@ -216,7 +210,7 @@ def list_to_csv_bytes(rows: list[dict], field_order: list[str]) -> bytes:
         writer.writerow({k: r.get(k, "") for k in field_order})
     return buf.getvalue().encode("utf-8")
 
-# --- UI ---
+# UI
 st.set_page_config(page_title="Email Finder + Soft Checker", page_icon="📧", layout="wide")
 st.title("Email Finder + Soft Checker")
 
@@ -236,7 +230,7 @@ if uploaded:
 
     rows, cols = read_csv_simple(uploaded)
 
-    # EMAIL VALIDATION MODE
+    # Email validation mode
     if "email" in cols:
         st.subheader("Validating provided emails")
         clean = []
@@ -260,7 +254,7 @@ if uploaded:
                 mime="text/csv",
             )
 
-    # DOMAIN CRAWL MODE
+    # Domain crawl mode
     elif ("domain" in cols) or ("website" in cols):
         st.subheader("Crawling domains to find emails")
         url_col = "domain" if "domain" in cols else "website"
@@ -307,7 +301,7 @@ if uploaded:
                 mime="text/csv",
             )
 
-    # SPECIFIC URL SCAN MODE
+    # Specific URL scan mode
     elif "url" in cols:
         st.subheader("Scanning specific URLs for emails")
         urls = [str(r.get("url", "")).strip() for r in rows if str(r.get("url", "")).startswith("http")]
