@@ -2,16 +2,13 @@ import asyncio
 import re
 import time
 from urllib.parse import urljoin, urlparse
+import csv
+import io
 
-import pandas as pd
 import streamlit as st
-
-# Networking
 import httpx
 import idna
 import dns.resolver
-import socket
-import ssl
 import smtplib
 from email.utils import parseaddr
 
@@ -25,7 +22,6 @@ EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 # --- Simple rate limiter ---
 _last_reset = time.time()
 _tokens = GLOBAL_REQUESTS_PER_MINUTE
-
 def rate_limit():
     global _last_reset, _tokens
     now = time.time()
@@ -52,7 +48,6 @@ async def fetch(client: httpx.AsyncClient, url: str) -> str:
     return ""
 
 async def robots_allows(client: httpx.AsyncClient, base: str, path: str) -> bool:
-    # Very light robots.txt check
     try:
         robots_url = urljoin(base, "/robots.txt")
         txt = await fetch(client, robots_url)
@@ -102,7 +97,7 @@ def has_mx(domain: str) -> bool:
         return False
 
 def smtp_soft_check(email: str, helo_domain: str = "minpack.com", use_smtp=True, timeout=6) -> str:
-    # Returns one of: "likely", "unknown", "unlikely"
+    # Returns: "likely", "unknown", "unlikely"
     name, addr = parseaddr(email)
     if not addr or "@" not in addr:
         return "unlikely"
@@ -131,11 +126,9 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
     seen = set()
     queue = []
     emails = set()
-
     queue.append(base_url)
     for path in ["/contact", "/contact-us", "/about", "/team"]:
         queue.append(urljoin(base_url, path))
-
     while queue and len(seen) < max_pages:
         url = queue.pop(0)
         if url in seen:
@@ -148,28 +141,43 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
         html = await fetch(client, url)
         if not html:
             continue
-        found = extract_emails(html)
-        for e in found:
+        for e in extract_emails(html):
             if not looks_junky(e):
                 emails.add(e)
-
         for href in re.findall(r'href=["\'](.*?)["\']', html, re.I):
             href_abs = urljoin(url, href)
             p = urlparse(href_abs)
             if p.netloc == urlparse(base_url).netloc:
                 if href_abs not in seen and len(seen) + len(queue) < max_pages:
                     queue.append(href_abs)
-
     return emails
 
-def clean_emails(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    df = df.copy()
-    df[col] = df[col].astype(str).str.strip().str.lower()
-    df = df[df[col].str.contains("@", na=False)]
-    df = df[~df[col].apply(looks_junky)]
-    df = df.drop_duplicates(subset=[col])
-    return df
+def read_csv_simple(file) -> list[dict]:
+    text = file.read().decode("utf-8", errors="ignore")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = [dict(r) for r in reader]
+    return rows
 
+def dedupe_rows(rows: list[dict], key: str) -> list[dict]:
+    seen = set()
+    out = []
+    for r in rows:
+        v = str(r.get(key, "")).strip().lower()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(r)
+    return out
+
+def list_to_csv_bytes(rows: list[dict], field_order: list[str]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=field_order, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in field_order})
+    return buf.getvalue().encode("utf-8")
+
+# --- UI ---
 st.set_page_config(page_title="Email Finder + Soft Checker", page_icon="📧", layout="wide")
 st.title("Email Finder + Soft Checker")
 
@@ -184,34 +192,44 @@ limit_per_domain = st.slider("Max pages per domain", 2, 15, PER_DOMAIN_PAGE_LIMI
 rpm = st.slider("Requests per minute", 20, 120, GLOBAL_REQUESTS_PER_MINUTE)
 
 if uploaded:
-    global GLOBAL_REQUESTS_PER_MINUTE, PER_DOMAIN_PAGE_LIMIT
     GLOBAL_REQUESTS_PER_MINUTE = rpm
     PER_DOMAIN_PAGE_LIMIT = limit_per_domain
 
-    df = pd.read_csv(uploaded)
-    cols = [c.lower().strip() for c in df.columns]
-    mapping = {old: old.lower().strip() for old in df.columns}
-    df = df.rename(columns=mapping)
+    rows = read_csv_simple(uploaded)
+    cols = {c.lower().strip() for c in (rows[0].keys() if rows else [])}
 
-    if "email" in df.columns:
+    # EMAIL VALIDATION MODE
+    if "email" in cols:
         st.subheader("Validating provided emails")
-        df_clean = clean_emails(df, "email")
-        with st.spinner("Checking DNS and SMTP..."):
-            out_rows = []
-            for email in df_clean["email"].tolist():
-                domain = email.split("@")[-1]
-                mx = has_mx(domain)
-                verdict = smtp_soft_check(email, use_smtp=use_smtp) if mx else "unlikely"
-                out_rows.append({"email": email, "domain": domain, "mx": mx, "status": verdict})
-            out = pd.DataFrame(out_rows)
-        st.dataframe(out)
-        st.download_button("Download results CSV", out.to_csv(index=False).encode("utf-8"), file_name="emails_validated.csv", mime="text/csv")
+        clean = []
+        for r in rows:
+            email = str(r.get("email", "")).strip().lower()
+            if not email or "@" not in email or looks_junky(email):
+                continue
+            dom = email.split("@")[-1]
+            mx = has_mx(dom)
+            status = smtp_soft_check(email, use_smtp=use_smtp) if mx else "unlikely"
+            clean.append({"email": email, "domain": dom, "mx": mx, "status": status})
+        clean = dedupe_rows(clean, "email")
+        if not clean:
+            st.warning("No valid-looking emails provided.")
+        else:
+            st.dataframe(clean, use_container_width=True)
+            st.download_button(
+                "Download results CSV",
+                list_to_csv_bytes(clean, ["email", "domain", "mx", "status"]),
+                file_name="emails_validated.csv",
+                mime="text/csv",
+            )
 
-    elif any(c in cols for c in ["domain", "website"]):
+    # DOMAIN CRAWL MODE
+    elif ("domain" in cols) or ("website" in cols):
         st.subheader("Crawling domains to find emails")
-        url_col = "domain" if "domain" in df.columns else "website"
+        url_col = "domain" if "domain" in cols else "website"
 
-        def to_base(u):
+        def to_base(u: str | None):
+            if not u:
+                return None
             u = str(u).strip()
             if not u:
                 return None
@@ -219,7 +237,7 @@ if uploaded:
                 u = "https://" + u
             return u
 
-        bases = [to_base(u) for u in df[url_col].tolist()]
+        bases = [to_base(r.get(url_col)) for r in rows]
         bases = [b for b in bases if b]
 
         async def run_crawl():
@@ -233,22 +251,28 @@ if uploaded:
                         mx = has_mx(dom)
                         status = smtp_soft_check(e, use_smtp=use_smtp) if mx else "unlikely"
                         found_rows.append({"source": base, "email": e, "domain": dom, "mx": mx, "status": status})
-            return pd.DataFrame(found_rows)
+            return found_rows
 
         with st.spinner("Crawling and checking..."):
             out = asyncio.run(run_crawl())
 
-        if out.empty:
+        out = [r for r in out if not looks_junky(r["email"])]
+        out = dedupe_rows(out, "email")
+        if not out:
             st.warning("No emails found. Try raising page limit or add more specific URLs like /contact.")
         else:
-            out = clean_emails(out, "email")
-            st.dataframe(out)
-            st.download_button("Download results CSV", out.to_csv(index=False).encode("utf-8"), file_name="emails_found_checked.csv", mime="text/csv")
+            st.dataframe(out, use_container_width=True)
+            st.download_button(
+                "Download results CSV",
+                list_to_csv_bytes(out, ["source", "email", "domain", "mx", "status"]),
+                file_name="emails_found_checked.csv",
+                mime="text/csv",
+            )
 
-    elif "url" in df.columns:
+    # SPECIFIC URL SCAN MODE
+    elif "url" in cols:
         st.subheader("Scanning specific URLs for emails")
-
-        urls = [u for u in df["url"].astype(str).tolist() if u.startswith("http")]
+        urls = [str(r.get("url", "")).strip() for r in rows if str(r.get("url", "")).startswith("http")]
 
         async def run_pages():
             found_rows = []
@@ -264,17 +288,22 @@ if uploaded:
                         mx = has_mx(dom)
                         status = smtp_soft_check(e, use_smtp=use_smtp) if mx else "unlikely"
                         found_rows.append({"source": u, "email": e, "domain": dom, "mx": mx, "status": status})
-            return pd.DataFrame(found_rows)
+            return found_rows
 
         with st.spinner("Fetching and checking..."):
             out = asyncio.run(run_pages())
 
-        if out.empty:
+        out = dedupe_rows(out, "email")
+        if not out:
             st.warning("No emails found on provided pages.")
         else:
-            out = clean_emails(out, "email")
-            st.dataframe(out)
-            st.download_button("Download results CSV", out.to_csv(index=False).encode("utf-8"), file_name="emails_from_urls.csv", mime="text/csv")
+            st.dataframe(out, use_container_width=True)
+            st.download_button(
+                "Download results CSV",
+                list_to_csv_bytes(out, ["source", "email", "domain", "mx", "status"]),
+                file_name="emails_from_urls.csv",
+                mime="text/csv",
+            )
 
     else:
         st.error("Your CSV must have one of these columns: email, domain or website, url")
