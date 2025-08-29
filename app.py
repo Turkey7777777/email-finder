@@ -152,11 +152,50 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
                     queue.append(href_abs)
     return emails
 
-def read_csv_simple(file) -> list[dict]:
-    text = file.read().decode("utf-8", errors="ignore")
-    reader = csv.DictReader(io.StringIO(text))
-    rows = [dict(r) for r in reader]
-    return rows
+# --- Robust CSV handling ---
+def read_csv_simple(file):
+    # Read bytes and decode while stripping UTF-8 BOM if present
+    raw = file.read().decode("utf-8-sig", errors="ignore")
+
+    # Detect delimiter from the first ~2KB, fallback to comma
+    try:
+        dialect = csv.Sniffer().sniff(raw[:2048])
+        delim = dialect.delimiter
+    except Exception:
+        delim = ","
+
+    rdr = csv.reader(io.StringIO(raw), delimiter=delim)
+    rows_list = list(rdr)
+    if not rows_list:
+        return [], set()
+
+    # Normalize header or synthesize if missing
+    header = [h.strip().strip('"\'' ).lower() for h in rows_list[0]]
+    canonical_any = {"email", "emails", "e-mail", "mail", "domain", "website", "site", "url", "link", "page"}
+    if not any(h in canonical_any for h in header):
+        # No recognizable header, treat first row as data and synthesize col names
+        header = [f"col{i+1}" for i in range(len(rows_list[0]))]
+        data_rows = rows_list
+    else:
+        data_rows = rows_list[1:]
+
+    # Build dict rows and normalize keys to canonical names
+    norm_rows = []
+    for r in data_rows:
+        d = {}
+        for k, v in zip(header, r):
+            key = k.strip().lower()
+            if key in {"emails", "e-mail", "mail"}:
+                key = "email"
+            if key in {"website", "site"}:
+                key = "website"
+            if key in {"link", "page"}:
+                key = "url"
+            d[key] = (v or "").strip()
+        norm_rows.append(d)
+
+    cols = set(norm_rows[0].keys()) if norm_rows else set()
+    return norm_rows, cols
 
 def dedupe_rows(rows: list[dict], key: str) -> list[dict]:
     seen = set()
@@ -195,8 +234,7 @@ if uploaded:
     GLOBAL_REQUESTS_PER_MINUTE = rpm
     PER_DOMAIN_PAGE_LIMIT = limit_per_domain
 
-    rows = read_csv_simple(uploaded)
-    cols = {c.lower().strip() for c in (rows[0].keys() if rows else [])}
+    rows, cols = read_csv_simple(uploaded)
 
     # EMAIL VALIDATION MODE
     if "email" in cols:
