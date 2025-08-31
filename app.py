@@ -262,6 +262,111 @@ def read_csv_simple(file):
     rows = [{"email": ln} for ln in lines if ln]
     return rows, {"email"}
 
+# ===== Name extraction, pattern inference, and generation =====
+# Simple name extractor (no external libs)
+NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
+COMMON_BAD_TOKENS = {
+    "Privacy", "Policy", "Terms", "Contact", "About", "Team", "Careers", "Blog",
+    "Email", "Support", "Downloads", "Press", "Investors", "Leadership", "Staff",
+    "Menu", "Submit", "Subscribe", "Cookie", "Manager", "Director", "Engineer",
+    "Home", "Services", "Solutions"
+}
+def extract_candidate_names(html: str) -> list[str]:
+    raw = NAME_RE.findall(html or "")
+    out = []
+    seen = set()
+    for full in raw:
+        full = " ".join(w.strip() for w in full.split())
+        parts = full.split()
+        if len(parts) < 2:
+            continue
+        if any(p in COMMON_BAD_TOKENS for p in parts):
+            continue
+        if not all(p.isalpha() and 2 <= len(p) <= 20 for p in parts):
+            continue
+        key = full.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(full)
+    return out
+
+def _first(n):  return n.split()[0].lower()
+def _last(n):   return n.split()[-1].lower()
+def _fi(n):     return n.split()[0][0].lower()
+def _li(n):     return n.split()[-1][0].lower()
+
+PATTERNS = {
+    "first.last":      lambda n: f"{_first(n)}.{_last(n)}",
+    "firstlast":       lambda n: f"{_first(n)}{_last(n)}",
+    "flast":           lambda n: f"{_fi(n)}{_last(n)}",
+    "firstl":          lambda n: f"{_first(n)}{_li(n)}",
+    "f.last":          lambda n: f"{_fi(n)}.{_last(n)}",
+    "first_last":      lambda n: f"{_first(n)}_{_last(n)}",
+    "first-last":      lambda n: f"{_first(n)}-{_last(n)}",
+    "first":           lambda n: _first(n),
+    "last":            lambda n: _last(n),
+    "lastf":           lambda n: f"{_last(n)}{_fi(n)}",
+}
+
+def infer_pattern_for_domain(domain: str, found_emails: set[str], candidate_names: list[str]):
+    """
+    Returns (best_pattern_key, confidence_float [0..1], matches_count, tested_names_count)
+    Strategy:
+      1) locals_on_domain = set of local parts from emails on this domain
+      2) try each pattern across candidate names and count exact matches
+      3) pick pattern with most matches (confidence ~ hits / max(3, tested))
+    """
+    locals_on_domain = set()
+    for e in found_emails:
+        e = e.strip().lower()
+        if "@" not in e:
+            continue
+        local, _, dom = e.partition("@")
+        if dom == domain.lower():
+            locals_on_domain.add(local)
+
+    tested_total = 0
+    best_key = None
+    best_hits = -1
+    best_tested = 0
+
+    for key, fn in PATTERNS.items():
+        hits = 0
+        checked = 0
+        for name in candidate_names:
+            try:
+                lp = fn(name)
+            except Exception:
+                continue
+            checked += 1
+            if lp in locals_on_domain:
+                hits += 1
+        if checked > 0 and hits > best_hits:
+            best_hits = hits
+            best_key = key
+            best_tested = checked
+        tested_total = max(tested_total, checked)
+
+    if best_key is None or tested_total == 0:
+        return None, 0.0, 0, 0
+
+    confidence = best_hits / max(3, best_tested)
+    return best_key, confidence, best_hits, best_tested
+
+def generate_emails(names: list[str], domain: str, pattern_key: str) -> list[dict]:
+    res = []
+    fn = PATTERNS.get(pattern_key)
+    if not fn:
+        return res
+    for n in names:
+        try:
+            local = fn(n)
+            res.append({"name": n, "email": f"{local}@{domain.lower()}", "pattern": pattern_key})
+        except Exception:
+            continue
+    return res
+
 # ===== UI =====
 st.set_page_config(page_title="Email Finder + Soft Checker", page_icon="📧", layout="wide")
 st.title("Email Finder + Soft Checker")
@@ -396,6 +501,96 @@ if uploaded:
                                list_to_csv_bytes(final_rows, ["source", "email", "domain", "mx", "status"]),
                                file_name="emails_found_checked.csv",
                                mime="text/csv")
+
+        # ===== Pattern inference + Top People generation =====
+        st.subheader("Pattern inference & Top People (experimental)")
+        want_generate = st.checkbox("Generate top 7 contacts per domain (infer pattern from site)", value=True)
+
+        if want_generate:
+            GEN_ROWS = []
+            people_paths = ["/about", "/team", "/leadership", "/company", "/staff"]
+            # Build an index of emails found per domain
+            emails_by_domain = {}
+            for r in final_rows:
+                try:
+                    dom = r.get("domain","").strip().lower()
+                    eml = r.get("email","").strip().lower()
+                    if dom and eml:
+                        emails_by_domain.setdefault(dom, set()).add(eml)
+                except Exception:
+                    pass
+
+            with st.spinner("Inferring patterns and generating contacts..."):
+                async def process_generation():
+                    async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+                        for base in bases:
+                            b = base.rstrip("/")
+                            dom = urlparse(base).netloc.lower()
+                            # gather names from likely pages
+                            names_pool = []
+                            for pth in people_paths:
+                                try:
+                                    html = await run_with_timeout(fetch(client, f"{b}{pth}"), seconds=10)
+                                    if not html:
+                                        continue
+                                    names_pool.extend(extract_candidate_names(html))
+                                    if len(names_pool) >= 40:
+                                        break
+                                except Exception:
+                                    continue
+                            # pick top 7 unique names by first occurrence
+                            seen = set()
+                            uniq_names = []
+                            for nm in names_pool:
+                                key = nm.lower()
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                uniq_names.append(nm)
+                                if len(uniq_names) >= 7:
+                                    break
+
+                            found_emails = emails_by_domain.get(dom, set())
+                            pattern, conf, hits, tested = infer_pattern_for_domain(dom, found_emails, uniq_names)
+
+                            if pattern and conf >= 0.34 and uniq_names:
+                                generated = generate_emails(uniq_names, dom, pattern)
+                                for g in generated:
+                                    GEN_ROWS.append({
+                                        "domain": dom,
+                                        "pattern": pattern,
+                                        "confidence": f"{conf:.2f}",
+                                        "name": g["name"],
+                                        "email": g["email"],
+                                        "evidence_emails_seen": len(found_emails),
+                                        "names_tested": tested,
+                                        "names_matched": hits
+                                    })
+                            else:
+                                # not enough evidence: record the reasoning row so you know why nothing was generated
+                                GEN_ROWS.append({
+                                    "domain": dom,
+                                    "pattern": "(insufficient evidence)",
+                                    "confidence": f"{conf:.2f}",
+                                    "name": "",
+                                    "email": "",
+                                    "evidence_emails_seen": len(found_emails),
+                                    "names_tested": tested,
+                                    "names_matched": hits
+                                })
+                asyncio.run(process_generation())
+
+            if GEN_ROWS:
+                st.write("We only generate when we have evidence from that company's real emails. No evidence ⇒ no guessing.")
+                st.dataframe(GEN_ROWS, use_container_width=True)
+                st.download_button(
+                    "Download generated contacts CSV",
+                    list_to_csv_bytes(GEN_ROWS, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched"]),
+                    file_name="generated_contacts.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("No patterns inferred yet. Try more pages per domain or include more domains with visible emails.")
 
     # ===== SPECIFIC URL SCAN MODE =====
     elif "url" in cols:
