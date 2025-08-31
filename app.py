@@ -263,7 +263,6 @@ def read_csv_simple(file):
     return rows, {"email"}
 
 # ===== Name extraction, pattern inference, and generation =====
-# Simple name extractor (no external libs)
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 COMMON_BAD_TOKENS = {
     "Privacy", "Policy", "Terms", "Contact", "About", "Team", "Careers", "Blog",
@@ -312,10 +311,6 @@ PATTERNS = {
 def infer_pattern_for_domain(domain: str, found_emails: set[str], candidate_names: list[str]):
     """
     Returns (best_pattern_key, confidence_float [0..1], matches_count, tested_names_count)
-    Strategy:
-      1) locals_on_domain = set of local parts from emails on this domain
-      2) try each pattern across candidate names and count exact matches
-      3) pick pattern with most matches (confidence ~ hits / max(3, tested))
     """
     locals_on_domain = set()
     for e in found_emails:
@@ -406,6 +401,7 @@ if uploaded:
 
         for e in input_list:
             done_state["done"] += 1
+            st.write(f"Validated {done_state['done']} of {total} emails")
             # quick filters / skip already processed
             if looks_junky(e) or e in processed:
                 pbar.progress(done_state["done"] / max(total, 1))
@@ -419,6 +415,7 @@ if uploaded:
                             ["email", "domain", "mx", "status"])
             processed.add(e)
             pbar.progress(done_state["done"] / max(total, 1))
+            st.write(f"Validated {done_state['done']} of {total} emails")
 
         final_rows = [r for r in read_rows_csv(PARTIAL_VALIDATE) if r.get("email","").strip().lower() in set(input_list)]
         final_rows = dedupe_rows(final_rows, "email")
@@ -464,6 +461,7 @@ if uploaded:
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                 for base in bases:
                     state["done"] += 1
+                    st.write(f"Processed {state['done']} of {total} domains")
                     if resume_partial and base in processed_sources:
                         pbar.progress(state["done"] / max(total, 1))
                         continue
@@ -487,6 +485,7 @@ if uploaded:
                     if out_rows:
                         append_rows_csv(PARTIAL_DOMAIN, out_rows, ["source", "email", "domain", "mx", "status"])
                     pbar.progress(state["done"] / max(total, 1))
+                    st.write(f"Processed {state['done']} of {total} domains")
 
         with st.spinner("Crawling and checking..."):
             asyncio.run(run_crawl())
@@ -567,7 +566,6 @@ if uploaded:
                                         "names_matched": hits
                                     })
                             else:
-                                # not enough evidence: record the reasoning row so you know why nothing was generated
                                 GEN_ROWS.append({
                                     "domain": dom,
                                     "pattern": "(insufficient evidence)",
@@ -612,6 +610,7 @@ if uploaded:
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                 for u in urls:
                     state["done"] += 1
+                    st.write(f"Processed {state['done']} of {total} URLs")
                     if resume_partial and u in processed_sources:
                         pbar.progress(state["done"] / max(total, 1))
                         continue
@@ -632,6 +631,7 @@ if uploaded:
                     if found:
                         append_rows_csv(PARTIAL_URL, found, ["source", "email", "domain", "mx", "status"])
                     pbar.progress(state["done"] / max(total, 1))
+                    st.write(f"Processed {state['done']} of {total} URLs")
 
         with st.spinner("Fetching and checking..."):
             asyncio.run(run_pages())
