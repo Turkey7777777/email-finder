@@ -96,6 +96,29 @@ async def run_with_timeout(coro, seconds: int):
     except asyncio.TimeoutError:
         return None
 
+# ---- Persisted upload + partial download helpers ----
+def get_uploaded_file(uploaded, state_key="upload_cache"):
+    """Return a BytesIO for the uploaded file that survives reruns."""
+    if uploaded is not None:
+        b = uploaded.getvalue()
+        st.session_state[state_key] = {"bytes": b, "name": uploaded.name}
+        return io.BytesIO(b), uploaded.name
+    cache = st.session_state.get(state_key)
+    if cache:
+        return io.BytesIO(cache["bytes"]), cache["name"]
+    return None, None
+
+def download_partial_button(path: str, label: str, filename: str, fields: list[str]):
+    """Show a download button for whatever is saved so far."""
+    if os.path.exists(path):
+        rows = read_rows_csv(path)
+        if rows:
+            st.download_button(label, list_to_csv_bytes(rows, fields), file_name=filename, mime="text/csv")
+        else:
+            st.caption("No partial rows yet.")
+    else:
+        st.caption("No partial file yet.")
+
 # ===== DNS & SMTP with tight timeouts =====
 def has_mx(domain: str, timeout=2) -> bool:
     try:
@@ -226,8 +249,8 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
     return emails
 
 # ===== Robust CSV reader (BOM + odd delimiters + headerless single-column) =====
-def read_csv_simple(file):
-    raw = file.read()
+def read_csv_simple(file_like):
+    raw = file_like.read()
     text = raw.decode("utf-8-sig", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not text:
         return [], set()
@@ -371,18 +394,19 @@ st.write("2) `url` column of pages to scan")
 st.write("3) `email` column to validate")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
+file_buf, filename = get_uploaded_file(uploaded)  # persist across reruns
 use_smtp = st.toggle("Use SMTP soft check", value=True, help="Turns on a light RCPT handshake; can be slow")
 limit_per_domain = st.slider("Max pages per domain", 2, 15, PER_DOMAIN_PAGE_LIMIT)
 rpm = st.slider("Requests per minute", 20, 120, GLOBAL_REQUESTS_PER_MINUTE)
 resume_partial = st.checkbox("Resume from previous partial", value=True)
 clear_partial = st.checkbox("Clear partial before run", value=False)
 
-if uploaded:
+if file_buf:
     # apply UI-configured limits
     GLOBAL_REQUESTS_PER_MINUTE = rpm
     PER_DOMAIN_PAGE_LIMIT = limit_per_domain
 
-    rows, cols = read_csv_simple(uploaded)
+    rows, cols = read_csv_simple(file_buf)
 
     # ===== EMAIL VALIDATION MODE =====
     if "email" in cols:
@@ -391,31 +415,46 @@ if uploaded:
         if clear_partial:
             delete_file(PARTIAL_VALIDATE)
 
-        partial_rows = read_rows_csv(PARTIAL_VALIDATE) if resume_partial else []
-        processed = {r.get("email", "").strip().lower() for r in partial_rows}
-
+        # Build input list first
         input_list = [str(r.get("email", "")).strip().lower() for r in rows if str(r.get("email", "")).strip()]
         total = len(input_list)
+
+        # Load partial and restrict to this run's inputs
+        partial_rows = read_rows_csv(PARTIAL_VALIDATE) if resume_partial else []
+        processed = {r.get("email", "").strip().lower() for r in partial_rows if r.get("email", "").strip().lower() in set(input_list)}
+
+        # Preload progress if resuming
         pbar = st.progress(0.0)
-        done_state = {"done": 0}
+        status = st.empty()
+        already_done = len(processed)
+        pbar.progress(already_done / max(total, 1))
+        status.markdown(f"**Validated {already_done} of {total} emails (resuming)**" if resume_partial and already_done else f"**Validated 0 of {total} emails**")
 
+        # Always-on partial download
+        st.markdown("### Download current partial")
+        download_partial_button(
+            PARTIAL_VALIDATE,
+            "Download current partial (validation)",
+            "emails_validated_partial.csv",
+            ["email","domain","mx","status"],
+        )
+
+        done = already_done
         for e in input_list:
-            done_state["done"] += 1
-            st.write(f"Validated {done_state['done']} of {total} emails")
-            # quick filters / skip already processed
-            if looks_junky(e) or e in processed:
-                pbar.progress(done_state["done"] / max(total, 1))
+            if e in processed or looks_junky(e):
+                done += 1
+                pbar.progress(done / max(total, 1))
+                status.markdown(f"**Validated {done} of {total} emails**")
                 continue
-
             dom = e.split("@")[-1]
             mx = has_mx(dom, timeout=2)
-            status = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
-
-            append_rows_csv(PARTIAL_VALIDATE, [{"email": e, "domain": dom, "mx": mx, "status": status}],
+            status_str = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
+            append_rows_csv(PARTIAL_VALIDATE, [{"email": e, "domain": dom, "mx": mx, "status": status_str}],
                             ["email", "domain", "mx", "status"])
             processed.add(e)
-            pbar.progress(done_state["done"] / max(total, 1))
-            st.write(f"Validated {done_state['done']} of {total} emails")
+            done += 1
+            pbar.progress(done / max(total, 1))
+            status.markdown(f"**Validated {done} of {total} emails**")
 
         final_rows = [r for r in read_rows_csv(PARTIAL_VALIDATE) if r.get("email","").strip().lower() in set(input_list)]
         final_rows = dedupe_rows(final_rows, "email")
@@ -449,24 +488,40 @@ if uploaded:
 
         bases = [to_base(r.get(url_col)) for r in rows]
         bases = [b for b in bases if b]
-
-        partial_rows = read_rows_csv(PARTIAL_DOMAIN) if resume_partial else []
-        processed_sources = {r.get("source","").strip() for r in partial_rows}
-
         total = len(bases)
-        state = {"done": 0}
+
+        # Load partial and compute processed sources for *this* run
+        partial_rows = read_rows_csv(PARTIAL_DOMAIN) if resume_partial else []
+        processed_sources = {r.get("source","").strip() for r in partial_rows if r.get("source","").strip() in set(bases)}
+
+        # Preload progress if resuming
         pbar = st.progress(0.0)
+        status = st.empty()
+        already_done = len(processed_sources)
+        pbar.progress(already_done / max(total, 1))
+        status.markdown(f"**Processed {already_done} of {total} domains (resuming)**" if resume_partial and already_done else f"**Processed 0 of {total} domains**")
+
+        # Always-on partial download
+        st.markdown("### Download current partial")
+        download_partial_button(
+            PARTIAL_DOMAIN,
+            "Download current partial (domain crawl)",
+            "emails_found_checked_partial.csv",
+            ["source","email","domain","mx","status"],
+        )
+
+        state = {"done": already_done}
 
         async def run_crawl():
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                 for base in bases:
-                    state["done"] += 1
-                    st.write(f"Processed {state['done']} of {total} domains")
                     if resume_partial and base in processed_sources:
+                        state["done"] += 1
                         pbar.progress(state["done"] / max(total, 1))
+                        status.markdown(f"**Processed {state['done']} of {total} domains**")
                         continue
 
-                    st.write(f"Scanning: {base}")
+                    status.markdown(f"**Processed {state['done']} of {total} domains**  \nScanning: {base}")
                     emails = await run_with_timeout(
                         crawl_domain(client, base, max_pages=PER_DOMAIN_PAGE_LIMIT),
                         seconds=20  # hard stop per domain
@@ -479,13 +534,15 @@ if uploaded:
                             continue
                         dom = e.split("@")[-1]
                         mx = has_mx(dom, timeout=2)
-                        status = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
-                        out_rows.append({"source": base, "email": e, "domain": dom, "mx": mx, "status": status})
+                        status_str = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
+                        out_rows.append({"source": base, "email": e, "domain": dom, "mx": mx, "status": status_str})
 
                     if out_rows:
                         append_rows_csv(PARTIAL_DOMAIN, out_rows, ["source", "email", "domain", "mx", "status"])
+
+                    state["done"] += 1
                     pbar.progress(state["done"] / max(total, 1))
-                    st.write(f"Processed {state['done']} of {total} domains")
+                    status.markdown(f"**Processed {state['done']} of {total} domains**")
 
         with st.spinner("Crawling and checking..."):
             asyncio.run(run_crawl())
@@ -598,24 +655,39 @@ if uploaded:
             delete_file(PARTIAL_URL)
 
         urls = [str(r.get("url", "")).strip() for r in rows if str(r.get("url", "")).strip().startswith("http")]
+        total = len(urls)
 
         partial_rows = read_rows_csv(PARTIAL_URL) if resume_partial else []
-        processed_sources = {r.get("source","").strip() for r in partial_rows}
+        processed_sources = {r.get("source","").strip() for r in partial_rows if r.get("source","").strip() in set(urls)}
 
-        total = len(urls)
-        state = {"done": 0}
+        # Preload progress if resuming
         pbar = st.progress(0.0)
+        status = st.empty()
+        already_done = len(processed_sources)
+        pbar.progress(already_done / max(total, 1))
+        status.markdown(f"**Processed {already_done} of {total} URLs (resuming)**" if resume_partial and already_done else f"**Processed 0 of {total} URLs**")
+
+        # Always-on partial download
+        st.markdown("### Download current partial")
+        download_partial_button(
+            PARTIAL_URL,
+            "Download current partial (URL scan)",
+            "emails_from_urls_partial.csv",
+            ["source","email","domain","mx","status"],
+        )
+
+        state = {"done": already_done}
 
         async def run_pages():
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                 for u in urls:
-                    state["done"] += 1
-                    st.write(f"Processed {state['done']} of {total} URLs")
                     if resume_partial and u in processed_sources:
+                        state["done"] += 1
                         pbar.progress(state["done"] / max(total, 1))
+                        status.markdown(f"**Processed {state['done']} of {total} URLs**")
                         continue
 
-                    st.write(f"Scanning: {u}")
+                    status.markdown(f"**Processed {state['done']} of {total} URLs**  \nScanning: {u}")
                     html = await run_with_timeout(fetch(client, u), seconds=15)
                     html = html or ""
 
@@ -625,13 +697,15 @@ if uploaded:
                             continue
                         dom = e.split("@")[-1]
                         mx = has_mx(dom, timeout=2)
-                        status = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
-                        found.append({"source": u, "email": e, "domain": dom, "mx": mx, "status": status})
+                        status_str = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
+                        found.append({"source": u, "email": e, "domain": dom, "mx": mx, "status": status_str})
 
                     if found:
                         append_rows_csv(PARTIAL_URL, found, ["source", "email", "domain", "mx", "status"])
+
+                    state["done"] += 1
                     pbar.progress(state["done"] / max(total, 1))
-                    st.write(f"Processed {state['done']} of {total} URLs")
+                    status.markdown(f"**Processed {state['done']} of {total} URLs**")
 
         with st.spinner("Fetching and checking..."):
             asyncio.run(run_pages())
