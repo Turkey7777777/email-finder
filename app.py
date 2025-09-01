@@ -115,14 +115,40 @@ def get_uploaded_file(uploaded, state_key="upload_cache"):
     return None, None
 
 # ---- No-rerun download links (data: URL) ----
+def _csv_to_data_uri(rows: list[dict], fields: list[str]) -> str:
+    csv_bytes = list_to_csv_bytes(rows, fields)
+    b64 = base64.b64encode(csv_bytes).decode("utf-8")
+    return f"data:text/csv;base64,{b64}"
+
 def download_link_from_rows(rows: list[dict], fields: list[str], filename: str, label: str):
     if not rows:
         st.caption("No partial rows yet.")
         return
-    csv_bytes = list_to_csv_bytes(rows, fields)
-    b64 = base64.b64encode(csv_bytes).decode("utf-8")
-    href = f'<a download="{filename}" href="data:text/csv;base64,{b64}">{label}</a>'
-    st.markdown(href, unsafe_allow_html=True)
+    href = _csv_to_data_uri(rows, fields)
+    st.markdown(f'<a download="{filename}" href="{href}">{label}</a>', unsafe_allow_html=True)
+
+# ===================== Deliverability Filtering =====================
+def _to_bool(x):
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in {"true", "1", "yes", "y"}
+
+def is_deliverable_row(row: dict) -> bool:
+    status = (row.get("status") or "").strip().lower()
+    mx_val = _to_bool(row.get("mx", ""))
+    return (status != "unlikely") and mx_val
+
+def filter_rows_deliverable(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if is_deliverable_row(r)]
+
+def download_filtered_link_from_rows(rows: list[dict], fields: list[str], filename: str, label: str):
+    rows_ok = filter_rows_deliverable(rows)
+    if not rows_ok:
+        st.caption("No deliverable rows yet (after filtering).")
+        return
+    href = _csv_to_data_uri(rows_ok, fields)
+    st.markdown(f'<a download="{filename}" href="{href}">{label} (kept {len(rows_ok)}/{len(rows)} rows)</a>', unsafe_allow_html=True)
 
 # ===================== DNS & SMTP =====================
 def has_mx(domain: str, timeout=2) -> bool:
@@ -508,7 +534,11 @@ if file_buf:
 
         st.markdown("### Download current partial")
         rows_now = read_rows_csv(PARTIAL_VALIDATE)
-        download_link_from_rows(rows_now, ["email","domain","mx","status"], "emails_validated_partial.csv", "Download current partial (validation)")
+        download_filtered_link_from_rows(
+            rows_now, ["email","domain","mx","status"],
+            "emails_validated_partial_filtered.csv",
+            "Download current partial (validation, deliverable only)"
+        )
 
         done = already_done
         for i, e in enumerate(input_list, start=1):
@@ -530,12 +560,17 @@ if file_buf:
 
         final_rows = [r for r in read_rows_csv(PARTIAL_VALIDATE) if r.get("email","").strip().lower() in set(input_list)]
         final_rows = dedupe_rows(final_rows, "email")
+        final_rows = filter_rows_deliverable(final_rows)
         if not final_rows:
-            st.warning("No valid-looking emails provided.")
+            st.warning("No deliverable emails after filtering.")
         else:
             st.dataframe(final_rows, use_container_width=True)
-            # Final results (you can keep this button; optional to convert to link)
-            st.download_button("Download results CSV", list_to_csv_bytes(final_rows, ["email", "domain", "mx", "status"]), file_name="emails_validated.csv", mime="text/csv")
+            st.download_button(
+                "Download results CSV (deliverable only)",
+                list_to_csv_bytes(final_rows, ["email","domain","mx","status"]),
+                file_name="emails_validated_filtered.csv",
+                mime="text/csv"
+            )
 
     # ========== DOMAIN CRAWL MODE ==========
     elif ("domain" in cols) or ("website" in cols):
@@ -568,9 +603,18 @@ if file_buf:
 
         st.markdown("### Download current partial")
         rows_now = read_rows_csv(PARTIAL_DOMAIN)
-        download_link_from_rows(rows_now, ["source","email","domain","mx","status"], "emails_found_checked_partial.csv", "Download current partial (domain crawl)")
+        download_filtered_link_from_rows(
+            rows_now, ["source","email","domain","mx","status"],
+            "emails_found_checked_partial_filtered.csv",
+            "Download current partial (domain crawl, deliverable only)"
+        )
         gen_now = read_rows_csv(PARTIAL_GEN_PARTIAL)
-        download_link_from_rows(gen_now, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"], "generated_contacts_partial.csv", "Download current partial (generated contacts)")
+        download_link_from_rows(
+            gen_now,
+            ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"],
+            "generated_contacts_partial.csv",
+            "Download current partial (generated contacts)"
+        )
 
         state = {"done": already_done}
 
@@ -699,20 +743,22 @@ if file_buf:
         # display evidence-based results for just this input set
         final_rows = [r for r in read_rows_csv(PARTIAL_DOMAIN) if r.get("source","") in set(bases)]
         final_rows = dedupe_rows(final_rows, "email")
+        final_rows = filter_rows_deliverable(final_rows)
         if not final_rows:
-            st.warning("No emails found. Try raising page limit or include more specific pages like /about or /team.")
+            st.warning("No deliverable emails found. Try raising page limit or include more specific pages like /about or /team.")
         else:
             st.dataframe(final_rows, use_container_width=True)
-            st.download_button("Download results CSV",
-                               list_to_csv_bytes(final_rows, ["source","email","domain","mx","status"]),
-                               file_name="emails_found_checked.csv", mime="text/csv")
+            st.download_button(
+                "Download results CSV (deliverable only)",
+                list_to_csv_bytes(final_rows, ["source","email","domain","mx","status"]),
+                file_name="emails_found_checked_filtered.csv", mime="text/csv"
+            )
 
-        # generated contacts (people-first + labeled guesses)
+        # generated contacts (people-first + labeled guesses) — no mx/status here, so no filter
         gen_rows_now = read_rows_csv(PARTIAL_GEN_PARTIAL)
         if gen_rows_now:
             st.subheader("Generated contacts (people-first; guesses labeled)")
             st.dataframe(gen_rows_now, use_container_width=True)
-            # final download button (end of run; safe to keep as widget)
             st.download_button(
                 "Download generated contacts CSV",
                 list_to_csv_bytes(gen_rows_now, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"]),
@@ -742,7 +788,11 @@ if file_buf:
 
         st.markdown("### Download current partial")
         rows_now = read_rows_csv(PARTIAL_URL)
-        download_link_from_rows(rows_now, ["source","email","domain","mx","status"], "emails_from_urls_partial.csv", "Download current partial (URL scan)")
+        download_filtered_link_from_rows(
+            rows_now, ["source","email","domain","mx","status"],
+            "emails_from_urls_partial_filtered.csv",
+            "Download current partial (URL scan, deliverable only)"
+        )
 
         state = {"done": already_done}
 
@@ -776,13 +826,16 @@ if file_buf:
 
         final_rows = [r for r in read_rows_csv(PARTIAL_URL) if r.get("source","") in set(urls)]
         final_rows = dedupe_rows(final_rows, "email")
+        final_rows = filter_rows_deliverable(final_rows)
         if not final_rows:
-            st.warning("No emails found on provided pages.")
+            st.warning("No deliverable emails found on provided pages.")
         else:
             st.dataframe(final_rows, use_container_width=True)
-            st.download_button("Download results CSV",
-                               list_to_csv_bytes(final_rows, ["source","email","domain","mx","status"]),
-                               file_name="emails_from_urls.csv", mime="text/csv")
+            st.download_button(
+                "Download results CSV (deliverable only)",
+                list_to_csv_bytes(final_rows, ["source","email","domain","mx","status"]),
+                file_name="emails_from_urls_filtered.csv", mime="text/csv"
+            )
 
     else:
         st.error("Your CSV must have one of these columns: email, domain or website, url")
