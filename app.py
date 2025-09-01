@@ -24,9 +24,9 @@ PARTIAL_DIR = "/tmp/minpack_email_finder"
 PARTIAL_VALIDATE = os.path.join(PARTIAL_DIR, "emails_validated_partial.csv")
 PARTIAL_DOMAIN = os.path.join(PARTIAL_DIR, "emails_found_checked_partial.csv")
 PARTIAL_URL = os.path.join(PARTIAL_DIR, "emails_from_urls_partial.csv")
-# NEW: track which domains are "done" even if they produced 0 emails
+# Track which domains are finished even if 0 emails found
 PARTIAL_DOMAIN_DONE = os.path.join(PARTIAL_DIR, "domains_done_partial.csv")
-# NEW: generated contacts partial (evidence-based and/or guesses)
+# Generated contacts partial (evidence-based + guesses)
 PARTIAL_GEN_PARTIAL = os.path.join(PARTIAL_DIR, "generated_contacts_partial.csv")
 
 # ===== Rate limiter =====
@@ -122,6 +122,14 @@ def download_partial_button(path: str, label: str, filename: str, fields: list[s
             st.caption("No partial rows yet.")
     else:
         st.caption("No partial file yet.")
+
+def progress_safe(pbar, done: int, total: int):
+    if total <= 0:
+        value = 0.0
+    else:
+        value = done / total
+    value = max(0.0, min(1.0, value))
+    pbar.progress(value)
 
 # ===== DNS & SMTP with tight timeouts =====
 def has_mx(domain: str, timeout=2) -> bool:
@@ -223,7 +231,7 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
     emails = set()
 
     queue.append(base_url)
-    for path in ["/contact", "/contact-us", "/about", "/team"]:
+    for path in ["/contact", "/contact-us", "/about", "/about-us", "/team", "/our-team", "/leadership", "/management", "/company", "/staff", "/news", "/blog"]:
         queue.append(urljoin(base_url, path))
 
     while queue and len(seen) < max_pages:
@@ -243,7 +251,7 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
                 emails.add(e)
 
         # Shallow internal link discovery
-        for href in re.findall(r'href=["\'](.*?)["\']', html, re.I):
+        for href in re.findall(r'href=[\"\'](.*?)[\"\']', html, re.I):
             href_abs = urljoin(url, href)
             p = urlparse(href_abs)
             if p.netloc == urlparse(base_url).netloc:
@@ -252,14 +260,13 @@ async def crawl_domain(client: httpx.AsyncClient, base_url: str, max_pages=PER_D
 
     return emails
 
-# ===== Robust CSV reader (BOM + odd delimiters + headerless single-column) =====
+# ===== Robust CSV reader =====
 def read_csv_simple(file_like):
     raw = file_like.read()
     text = raw.decode("utf-8-sig", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not text:
         return [], set()
 
-    # Try DictReader with common delimiters
     delimiters = [",", ";", "\t", "|"]
     for delim in delimiters:
         try:
@@ -284,18 +291,17 @@ def read_csv_simple(file_like):
         except Exception:
             continue
 
-    # Fallback: one value per line, treat as 'email' list
     lines = [ln.strip() for ln in text.split("\n")]
     rows = [{"email": ln} for ln in lines if ln]
     return rows, {"email"}
 
-# ===== Name extraction, pattern inference, and generation =====
+# ===== Name extraction, pattern inference, generation =====
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
 COMMON_BAD_TOKENS = {
     "Privacy", "Policy", "Terms", "Contact", "About", "Team", "Careers", "Blog",
     "Email", "Support", "Downloads", "Press", "Investors", "Leadership", "Staff",
     "Menu", "Submit", "Subscribe", "Cookie", "Manager", "Director", "Engineer",
-    "Home", "Services", "Solutions"
+    "Home", "Services", "Solutions", "News"
 }
 def extract_candidate_names(html: str) -> list[str]:
     raw = NAME_RE.findall(html or "")
@@ -390,10 +396,11 @@ def generate_emails(names: list[str], domain: str, pattern_key: str) -> list[dic
             continue
     return res
 
-# ===== Fallback guessing helpers =====
+# ===== Fallback guessing =====
 COMMON_PATTERN_ORDER = [
     "first.last", "flast", "firstlast", "f.last", "first", "last", "lastf", "first_last", "first-last"
 ]
+ROLE_ALIASES = ["info", "contact", "support", "sales", "hello", "careers", "press", "admin", "office"]
 
 def infer_separators_from_locals(local_parts: set[str]) -> set[str]:
     seps = set()
@@ -404,7 +411,7 @@ def infer_separators_from_locals(local_parts: set[str]) -> set[str]:
     return seps
 
 def guess_top_patterns_for_domain(found_emails: set[str], top_k: int = 2) -> list[str]:
-    # If we saw any emails on this domain, prefer patterns that use the same separators
+    # Prefer patterns that match separators seen on-domain
     local_parts = set()
     for e in found_emails:
         e = e.lower().strip()
@@ -413,18 +420,20 @@ def guess_top_patterns_for_domain(found_emails: set[str], top_k: int = 2) -> lis
             local_parts.add(lp)
     seps = infer_separators_from_locals(local_parts)
     ordered = COMMON_PATTERN_ORDER[:]
+
     if seps:
-        # If we saw dots, push dot-using patterns to the front etc.
+        # Simple scoring: boost patterns using observed separators
         def score(p):
             s = 0
             if "." in p and "." in "".join(local_parts): s += 2
             if "_" in p and "_" in "".join(local_parts): s += 2
             if "-" in p and "-" in "".join(local_parts): s += 2
-            # small bias for most common corporate patterns
+            # mild bias to very common corporate patterns
             if p == "first.last": s += 1
             if p == "flast": s += 1
             return -s
         ordered.sort(key=score)
+
     return ordered[:top_k]
 
 # ===== UI =====
@@ -442,9 +451,9 @@ limit_per_domain = st.slider("Max pages per domain", 2, 15, PER_DOMAIN_PAGE_LIMI
 rpm = st.slider("Requests per minute", 20, 120, GLOBAL_REQUESTS_PER_MINUTE)
 resume_partial = st.checkbox("Resume from previous partial", value=True)
 clear_partial = st.checkbox("Clear partial before run", value=False)
-# NEW: fallback mode toggle & how many guess patterns
 enable_fallback = st.checkbox("Enable fallback guessing (when no evidence)", value=True)
 fallback_top_k = st.slider("Fallback: number of patterns to try", 1, 3, 2)
+enable_guess_without_names = st.checkbox("If no names found, guess role emails (info@, sales@, ...)", value=True)
 
 if file_buf:
     # apply UI-configured limits
@@ -460,46 +469,44 @@ if file_buf:
         if clear_partial:
             delete_file(PARTIAL_VALIDATE)
 
-        # Build input list first
         input_list = [str(r.get("email", "")).strip().lower() for r in rows if str(r.get("email", "")).strip()]
         total = len(input_list)
 
-        # Load partial and restrict to this run's inputs
         partial_rows = read_rows_csv(PARTIAL_VALIDATE) if resume_partial else []
         processed = {r.get("email", "").strip().lower() for r in partial_rows if r.get("email", "").strip().lower() in set(input_list)}
 
-        # Preload progress if resuming
         pbar = st.progress(0.0)
-        status = st.empty()
+        row_status = st.empty()
+        done_status = st.empty()
         already_done = len(processed)
-        pbar.progress(already_done / max(total, 1))
-        status.markdown(f"**Validated {already_done} of {total} emails (resuming)**" if resume_partial and already_done else f"**Validated 0 of {total} emails**")
-
-        # Always-on partial download
-        st.markdown("### Download current partial")
-        download_partial_button(
-            PARTIAL_VALIDATE,
-            "Download current partial (validation)",
-            "emails_validated_partial.csv",
-            ["email","domain","mx","status"],
-        )
+        progress_safe(pbar, already_done, total)
+        done_status.markdown(f"**Done {already_done} of {total}** (resuming)" if already_done else f"**Done 0 of {total}**")
 
         done = already_done
-        for e in input_list:
+        st.markdown("### Download current partial")
+        download_partial_button(PARTIAL_VALIDATE, "Download current partial (validation)", "emails_validated_partial.csv", ["email","domain","mx","status"])
+
+        for i, e in enumerate(input_list, start=1):
+            row_status.markdown(f"**Row {i} of {total}** → {e}")
             if e in processed or looks_junky(e):
-                done += 1
-                pbar.progress(done / max(total, 1))
-                status.markdown(f"**Validated {done} of {total} emails**")
+                # skip, but do not double count if already_done covered it
+                if e not in processed:
+                    processed.add(e)
+                    done += 1
+                progress_safe(pbar, done, total)
+                done_status.markdown(f"**Done {done} of {total}**")
+                time.sleep(0.05)
                 continue
+
             dom = e.split("@")[-1]
             mx = has_mx(dom, timeout=2)
             status_str = smtp_soft_check(e, use_smtp=use_smtp, timeout=3) if mx else "unlikely"
-            append_rows_csv(PARTIAL_VALIDATE, [{"email": e, "domain": dom, "mx": mx, "status": status_str}],
-                            ["email", "domain", "mx", "status"])
+            append_rows_csv(PARTIAL_VALIDATE, [{"email": e, "domain": dom, "mx": mx, "status": status_str}], ["email", "domain", "mx", "status"])
             processed.add(e)
             done += 1
-            pbar.progress(done / max(total, 1))
-            status.markdown(f"**Validated {done} of {total} emails**")
+            progress_safe(pbar, done, total)
+            done_status.markdown(f"**Done {done} of {total}**")
+            time.sleep(0.05)
 
         final_rows = [r for r in read_rows_csv(PARTIAL_VALIDATE) if r.get("email","").strip().lower() in set(input_list)]
         final_rows = dedupe_rows(final_rows, "email")
@@ -507,10 +514,7 @@ if file_buf:
             st.warning("No valid-looking emails provided.")
         else:
             st.dataframe(final_rows, use_container_width=True)
-            st.download_button("Download results CSV",
-                               list_to_csv_bytes(final_rows, ["email", "domain", "mx", "status"]),
-                               file_name="emails_validated.csv",
-                               mime="text/csv")
+            st.download_button("Download results CSV", list_to_csv_bytes(final_rows, ["email", "domain", "mx", "status"]), file_name="emails_validated.csv", mime="text/csv")
 
     # ===== DOMAIN CRAWL MODE =====
     elif ("domain" in cols) or ("website" in cols):
@@ -537,47 +541,36 @@ if file_buf:
         bases = [b for b in bases if b]
         total = len(bases)
 
-        # Load "done" tracking and pre-load progress
         partial_done = read_rows_csv(PARTIAL_DOMAIN_DONE) if resume_partial else []
         processed_done = {r.get("source","").strip() for r in partial_done if r.get("source","").strip() in set(bases)}
 
         pbar = st.progress(0.0)
         status = st.empty()
+        row_status = st.empty()
+        done_status = st.empty()
         already_done = len(processed_done)
-        pbar.progress(already_done / max(total, 1))
-        status.markdown(f"**Processed {already_done} of {total} domains (resuming)**" if resume_partial and already_done else f"**Processed 0 of {total} domains**")
+        progress_safe(pbar, already_done, total)
+        done_status.markdown(f"**Done {already_done} of {total}** (resuming)" if already_done else f"**Done 0 of {total}**")
 
-        # Always-on partial download
         st.markdown("### Download current partial")
-        download_partial_button(
-            PARTIAL_DOMAIN,
-            "Download current partial (domain crawl)",
-            "emails_found_checked_partial.csv",
-            ["source","email","domain","mx","status"],
-        )
-        download_partial_button(
-            PARTIAL_GEN_PARTIAL,
-            "Download current partial (generated contacts)",
-            "generated_contacts_partial.csv",
-            ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"],
-        )
+        download_partial_button(PARTIAL_DOMAIN, "Download current partial (domain crawl)", "emails_found_checked_partial.csv", ["source","email","domain","mx","status"])
+        download_partial_button(PARTIAL_GEN_PARTIAL, "Download current partial (generated contacts)", "generated_contacts_partial.csv",
+                                ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"])
 
         state = {"done": already_done}
 
         async def run_crawl():
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-                for base in bases:
+                # process in strict CSV order
+                for i, base in enumerate(bases, start=1):
+                    row_status.markdown(f"**Row {i} of {total}** → {base}")
+
                     if resume_partial and base in processed_done:
-                        state["done"] += 1
-                        pbar.progress(state["done"] / max(total, 1))
-                        status.markdown(f"**Processed {state['done']} of {total} domains**")
+                        # already accounted for in 'already_done'; skip without increment
                         continue
 
-                    status.markdown(f"**Processed {state['done']} of {total} domains**  \nScanning: {base}")
-                    emails = await run_with_timeout(
-                        crawl_domain(client, base, max_pages=PER_DOMAIN_PAGE_LIMIT),
-                        seconds=20  # hard stop per domain
-                    )
+                    status.markdown(f"**Done {state['done']} of {total}**  \nScanning: {base}")
+                    emails = await run_with_timeout(crawl_domain(client, base, max_pages=PER_DOMAIN_PAGE_LIMIT), seconds=20)
                     emails = emails or set()
 
                     out_rows = []
@@ -592,20 +585,20 @@ if file_buf:
                     if out_rows:
                         append_rows_csv(PARTIAL_DOMAIN, out_rows, ["source", "email", "domain", "mx", "status"])
 
-                    # mark this domain as DONE regardless of found emails
+                    # mark domain done (even if 0 emails)
                     append_rows_csv(PARTIAL_DOMAIN_DONE, [{"source": base, "done": 1}], ["source", "done"])
                     processed_done.add(base)
 
                     # ---- On-the-fly pattern inference + generation per domain ----
-                    people_paths = ["/about", "/team", "/leadership", "/company", "/staff"]
+                    people_paths = ["/about", "/about-us", "/team", "/our-team", "/leadership", "/management", "/company", "/staff", "/news", "/blog", "/contact", "/contact-us"]
                     dom = urlparse(base).netloc.lower()
 
-                    # emails found so far for this domain (from results partial)
+                    # evidence emails found so far on this domain
                     emls = {r.get("email","").strip().lower()
                             for r in read_rows_csv(PARTIAL_DOMAIN)
                             if r.get("domain","").strip().lower() == dom}
 
-                    # fetch a few people pages and mine names
+                    # mine names
                     names_pool = []
                     for pth in people_paths:
                         try:
@@ -613,7 +606,7 @@ if file_buf:
                             if not html:
                                 continue
                             names_pool.extend(extract_candidate_names(html))
-                            if len(names_pool) >= 40:
+                            if len(names_pool) >= 60:
                                 break
                         except Exception:
                             continue
@@ -634,26 +627,20 @@ if file_buf:
 
                     gen_rows = []
                     if pattern and conf >= 0.34 and uniq_names:
+                        # evidence-based generation
                         for g in generate_emails(uniq_names, dom, pattern):
                             gen_rows.append({
-                                "domain": dom,
-                                "pattern": pattern,
-                                "confidence": f"{conf:.2f}",
-                                "name": g["name"],
-                                "email": g["email"],
-                                "evidence_emails_seen": len(emls),
-                                "names_tested": tested,
-                                "names_matched": hits,
-                                "guessed": "no",
-                                "guess_reason": ""
+                                "domain": dom, "pattern": pattern, "confidence": f"{conf:.2f}",
+                                "name": g["name"], "email": g["email"],
+                                "evidence_emails_seen": len(emls), "names_tested": tested, "names_matched": hits,
+                                "guessed": "no", "guess_reason": ""
                             })
                     else:
-                        # Evidence was insufficient: optionally guess
+                        # not enough evidence for a confident pattern
                         if enable_fallback and uniq_names:
-                            # choose top-k guessing patterns (biased by any separators seen)
+                            # guess top-k personal patterns using any observed separators
                             guess_patterns = guess_top_patterns_for_domain(emls, top_k=fallback_top_k)
                             reason = "no evidence; guessed via common patterns"
-                            # If any emails existed (on any route) with separators, say so:
                             if emls:
                                 locs = {e.split("@",1)[0] for e in emls if "@" in e}
                                 seps = infer_separators_from_locals(locs)
@@ -662,68 +649,68 @@ if file_buf:
                             for pk in guess_patterns:
                                 for g in generate_emails(uniq_names, dom, pk):
                                     gen_rows.append({
-                                        "domain": dom,
-                                        "pattern": pk,
-                                        "confidence": "0.00",
-                                        "name": g["name"],
-                                        "email": g["email"],
-                                        "evidence_emails_seen": len(emls),
-                                        "names_tested": tested,
-                                        "names_matched": hits,
-                                        "guessed": "yes",
-                                        "guess_reason": reason
+                                        "domain": dom, "pattern": pk, "confidence": "0.00",
+                                        "name": g["name"], "email": g["email"],
+                                        "evidence_emails_seen": len(emls), "names_tested": tested, "names_matched": hits,
+                                        "guessed": "yes", "guess_reason": reason
                                     })
+                        elif enable_guess_without_names and not uniq_names:
+                            # No names mined at all -> guess role aliases (up to 7)
+                            added = 0
+                            for role in ROLE_ALIASES:
+                                gen_rows.append({
+                                    "domain": dom, "pattern": "(role-alias)", "confidence": "0.00",
+                                    "name": "", "email": f"{role}@{dom}",
+                                    "evidence_emails_seen": len(emls), "names_tested": 0, "names_matched": 0,
+                                    "guessed": "yes", "guess_reason": "no names visible; generated common role aliases"
+                                })
+                                added += 1
+                                if added >= 7:
+                                    break
                         else:
-                            # record that we tried but aren't guessing
+                            # record attempt (no guessing)
                             gen_rows.append({
-                                "domain": dom,
-                                "pattern": "(insufficient evidence)",
-                                "confidence": f"{conf:.2f}",
-                                "name": "",
-                                "email": "",
-                                "evidence_emails_seen": len(emls),
-                                "names_tested": tested,
-                                "names_matched": hits,
-                                "guessed": "no",
-                                "guess_reason": ""
+                                "domain": dom, "pattern": "(insufficient evidence)", "confidence": f"{conf:.2f}",
+                                "name": "", "email": "",
+                                "evidence_emails_seen": len(emls), "names_tested": tested, "names_matched": hits,
+                                "guessed": "no", "guess_reason": ""
                             })
 
                     if gen_rows:
                         append_rows_csv(
-                            PARTIAL_GEN_PARTIAL,
-                            gen_rows,
+                            PARTIAL_GEN_PARTIAL, gen_rows,
                             ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"]
                         )
 
+                    # increment done (only for newly processed domain)
                     state["done"] += 1
-                    pbar.progress(state["done"] / max(total, 1))
-                    status.markdown(f"**Processed {state['done']} of {total} domains**")
+                    progress_safe(pbar, state["done"], total)
+                    done_status.markdown(f"**Done {state['done']} of {total}**")
+                    await asyncio.sleep(0.05)
 
         with st.spinner("Crawling and checking..."):
             asyncio.run(run_crawl())
 
-        # show final crawled emails (evidence-based) for just this run's bases
+        # Show final evidence-based results for this run's bases
         final_rows = [r for r in read_rows_csv(PARTIAL_DOMAIN) if r.get("source","") in set(bases)]
         final_rows = dedupe_rows(final_rows, "email")
         if not final_rows:
-            st.warning("No emails found. Try raising page limit or add more specific URLs like /contact.")
+            st.warning("No emails found. Try raising page limit or include more specific pages like /about or /team.")
         else:
             st.dataframe(final_rows, use_container_width=True)
             st.download_button("Download results CSV",
                                list_to_csv_bytes(final_rows, ["source", "email", "domain", "mx", "status"]),
-                               file_name="emails_found_checked.csv",
-                               mime="text/csv")
+                               file_name="emails_found_checked.csv", mime="text/csv")
 
-        # show generated contacts partial (evidence-based + guesses if enabled)
+        # Show generated contacts (evidence-based and/or guesses)
         gen_rows_now = read_rows_csv(PARTIAL_GEN_PARTIAL)
         if gen_rows_now:
-            st.subheader("Generated contacts (evidence-based and/or guesses)")
+            st.subheader("Generated contacts (evidence + guesses)")
             st.dataframe(gen_rows_now, use_container_width=True)
             st.download_button(
                 "Download generated contacts CSV",
                 list_to_csv_bytes(gen_rows_now, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"]),
-                file_name="generated_contacts.csv",
-                mime="text/csv",
+                file_name="generated_contacts.csv", mime="text/csv",
             )
         else:
             st.info("No generated contacts yet.")
@@ -741,34 +728,26 @@ if file_buf:
         partial_rows = read_rows_csv(PARTIAL_URL) if resume_partial else []
         processed_sources = {r.get("source","").strip() for r in partial_rows if r.get("source","").strip() in set(urls)}
 
-        # Preload progress if resuming
         pbar = st.progress(0.0)
-        status = st.empty()
+        row_status = st.empty()
+        done_status = st.empty()
         already_done = len(processed_sources)
-        pbar.progress(already_done / max(total, 1))
-        status.markdown(f"**Processed {already_done} of {total} URLs (resuming)**" if resume_partial and already_done else f"**Processed 0 of {total} URLs**")
+        progress_safe(pbar, already_done, total)
+        done_status.markdown(f"**Done {already_done} of {total}** (resuming)" if already_done else f"**Done 0 of {total}**")
 
-        # Always-on partial download
         st.markdown("### Download current partial")
-        download_partial_button(
-            PARTIAL_URL,
-            "Download current partial (URL scan)",
-            "emails_from_urls_partial.csv",
-            ["source","email","domain","mx","status"],
-        )
+        download_partial_button(PARTIAL_URL, "Download current partial (URL scan)", "emails_from_urls_partial.csv", ["source","email","domain","mx","status"])
 
         state = {"done": already_done}
 
         async def run_pages():
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-                for u in urls:
+                for i, u in enumerate(urls, start=1):
+                    row_status.markdown(f"**Row {i} of {total}** → {u}")
+
                     if resume_partial and u in processed_sources:
-                        state["done"] += 1
-                        pbar.progress(state["done"] / max(total, 1))
-                        status.markdown(f"**Processed {state['done']} of {total} URLs**")
                         continue
 
-                    status.markdown(f"**Processed {state['done']} of {total} URLs**  \nScanning: {u}")
                     html = await run_with_timeout(fetch(client, u), seconds=15)
                     html = html or ""
 
@@ -785,8 +764,9 @@ if file_buf:
                         append_rows_csv(PARTIAL_URL, found, ["source", "email", "domain", "mx", "status"])
 
                     state["done"] += 1
-                    pbar.progress(state["done"] / max(total, 1))
-                    status.markdown(f"**Processed {state['done']} of {total} URLs**")
+                    progress_safe(pbar, state["done"], total)
+                    done_status.markdown(f"**Done {state['done']} of {total}**")
+                    await asyncio.sleep(0.05)
 
         with st.spinner("Fetching and checking..."):
             asyncio.run(run_pages())
@@ -799,8 +779,7 @@ if file_buf:
             st.dataframe(final_rows, use_container_width=True)
             st.download_button("Download results CSV",
                                list_to_csv_bytes(final_rows, ["source", "email", "domain", "mx", "status"]),
-                               file_name="emails_from_urls.csv",
-                               mime="text/csv")
+                               file_name="emails_from_urls.csv", mime="text/csv")
 
     else:
         st.error("Your CSV must have one of these columns: email, domain or website, url")
