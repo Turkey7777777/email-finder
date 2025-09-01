@@ -24,6 +24,10 @@ PARTIAL_DIR = "/tmp/minpack_email_finder"
 PARTIAL_VALIDATE = os.path.join(PARTIAL_DIR, "emails_validated_partial.csv")
 PARTIAL_DOMAIN = os.path.join(PARTIAL_DIR, "emails_found_checked_partial.csv")
 PARTIAL_URL = os.path.join(PARTIAL_DIR, "emails_from_urls_partial.csv")
+# NEW: track which domains are "done" even if they produced 0 emails
+PARTIAL_DOMAIN_DONE = os.path.join(PARTIAL_DIR, "domains_done_partial.csv")
+# NEW: generated contacts partial (evidence-based and/or guesses)
+PARTIAL_GEN_PARTIAL = os.path.join(PARTIAL_DIR, "generated_contacts_partial.csv")
 
 # ===== Rate limiter =====
 _last_reset = time.time()
@@ -334,6 +338,7 @@ PATTERNS = {
 def infer_pattern_for_domain(domain: str, found_emails: set[str], candidate_names: list[str]):
     """
     Returns (best_pattern_key, confidence_float [0..1], matches_count, tested_names_count)
+    Evidence-based only.
     """
     locals_on_domain = set()
     for e in found_emails:
@@ -385,6 +390,43 @@ def generate_emails(names: list[str], domain: str, pattern_key: str) -> list[dic
             continue
     return res
 
+# ===== Fallback guessing helpers =====
+COMMON_PATTERN_ORDER = [
+    "first.last", "flast", "firstlast", "f.last", "first", "last", "lastf", "first_last", "first-last"
+]
+
+def infer_separators_from_locals(local_parts: set[str]) -> set[str]:
+    seps = set()
+    for lp in local_parts:
+        if "." in lp: seps.add(".")
+        if "_" in lp: seps.add("_")
+        if "-" in lp: seps.add("-")
+    return seps
+
+def guess_top_patterns_for_domain(found_emails: set[str], top_k: int = 2) -> list[str]:
+    # If we saw any emails on this domain, prefer patterns that use the same separators
+    local_parts = set()
+    for e in found_emails:
+        e = e.lower().strip()
+        if "@" in e:
+            lp = e.split("@", 1)[0]
+            local_parts.add(lp)
+    seps = infer_separators_from_locals(local_parts)
+    ordered = COMMON_PATTERN_ORDER[:]
+    if seps:
+        # If we saw dots, push dot-using patterns to the front etc.
+        def score(p):
+            s = 0
+            if "." in p and "." in "".join(local_parts): s += 2
+            if "_" in p and "_" in "".join(local_parts): s += 2
+            if "-" in p and "-" in "".join(local_parts): s += 2
+            # small bias for most common corporate patterns
+            if p == "first.last": s += 1
+            if p == "flast": s += 1
+            return -s
+        ordered.sort(key=score)
+    return ordered[:top_k]
+
 # ===== UI =====
 st.set_page_config(page_title="Email Finder + Soft Checker", page_icon="📧", layout="wide")
 st.title("Email Finder + Soft Checker")
@@ -400,6 +442,9 @@ limit_per_domain = st.slider("Max pages per domain", 2, 15, PER_DOMAIN_PAGE_LIMI
 rpm = st.slider("Requests per minute", 20, 120, GLOBAL_REQUESTS_PER_MINUTE)
 resume_partial = st.checkbox("Resume from previous partial", value=True)
 clear_partial = st.checkbox("Clear partial before run", value=False)
+# NEW: fallback mode toggle & how many guess patterns
+enable_fallback = st.checkbox("Enable fallback guessing (when no evidence)", value=True)
+fallback_top_k = st.slider("Fallback: number of patterns to try", 1, 3, 2)
 
 if file_buf:
     # apply UI-configured limits
@@ -473,6 +518,8 @@ if file_buf:
 
         if clear_partial:
             delete_file(PARTIAL_DOMAIN)
+            delete_file(PARTIAL_DOMAIN_DONE)
+            delete_file(PARTIAL_GEN_PARTIAL)
 
         url_col = "domain" if "domain" in cols else "website"
 
@@ -490,14 +537,13 @@ if file_buf:
         bases = [b for b in bases if b]
         total = len(bases)
 
-        # Load partial and compute processed sources for *this* run
-        partial_rows = read_rows_csv(PARTIAL_DOMAIN) if resume_partial else []
-        processed_sources = {r.get("source","").strip() for r in partial_rows if r.get("source","").strip() in set(bases)}
+        # Load "done" tracking and pre-load progress
+        partial_done = read_rows_csv(PARTIAL_DOMAIN_DONE) if resume_partial else []
+        processed_done = {r.get("source","").strip() for r in partial_done if r.get("source","").strip() in set(bases)}
 
-        # Preload progress if resuming
         pbar = st.progress(0.0)
         status = st.empty()
-        already_done = len(processed_sources)
+        already_done = len(processed_done)
         pbar.progress(already_done / max(total, 1))
         status.markdown(f"**Processed {already_done} of {total} domains (resuming)**" if resume_partial and already_done else f"**Processed 0 of {total} domains**")
 
@@ -509,13 +555,19 @@ if file_buf:
             "emails_found_checked_partial.csv",
             ["source","email","domain","mx","status"],
         )
+        download_partial_button(
+            PARTIAL_GEN_PARTIAL,
+            "Download current partial (generated contacts)",
+            "generated_contacts_partial.csv",
+            ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"],
+        )
 
         state = {"done": already_done}
 
         async def run_crawl():
             async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                 for base in bases:
-                    if resume_partial and base in processed_sources:
+                    if resume_partial and base in processed_done:
                         state["done"] += 1
                         pbar.progress(state["done"] / max(total, 1))
                         status.markdown(f"**Processed {state['done']} of {total} domains**")
@@ -540,6 +592,109 @@ if file_buf:
                     if out_rows:
                         append_rows_csv(PARTIAL_DOMAIN, out_rows, ["source", "email", "domain", "mx", "status"])
 
+                    # mark this domain as DONE regardless of found emails
+                    append_rows_csv(PARTIAL_DOMAIN_DONE, [{"source": base, "done": 1}], ["source", "done"])
+                    processed_done.add(base)
+
+                    # ---- On-the-fly pattern inference + generation per domain ----
+                    people_paths = ["/about", "/team", "/leadership", "/company", "/staff"]
+                    dom = urlparse(base).netloc.lower()
+
+                    # emails found so far for this domain (from results partial)
+                    emls = {r.get("email","").strip().lower()
+                            for r in read_rows_csv(PARTIAL_DOMAIN)
+                            if r.get("domain","").strip().lower() == dom}
+
+                    # fetch a few people pages and mine names
+                    names_pool = []
+                    for pth in people_paths:
+                        try:
+                            html = await run_with_timeout(fetch(client, f"{base.rstrip('/')}{pth}"), seconds=10)
+                            if not html:
+                                continue
+                            names_pool.extend(extract_candidate_names(html))
+                            if len(names_pool) >= 40:
+                                break
+                        except Exception:
+                            continue
+
+                    # top 7 unique names
+                    seen_n = set()
+                    uniq_names = []
+                    for nm in names_pool:
+                        key = nm.lower()
+                        if key in seen_n:
+                            continue
+                        seen_n.add(key)
+                        uniq_names.append(nm)
+                        if len(uniq_names) >= 7:
+                            break
+
+                    pattern, conf, hits, tested = infer_pattern_for_domain(dom, emls, uniq_names)
+
+                    gen_rows = []
+                    if pattern and conf >= 0.34 and uniq_names:
+                        for g in generate_emails(uniq_names, dom, pattern):
+                            gen_rows.append({
+                                "domain": dom,
+                                "pattern": pattern,
+                                "confidence": f"{conf:.2f}",
+                                "name": g["name"],
+                                "email": g["email"],
+                                "evidence_emails_seen": len(emls),
+                                "names_tested": tested,
+                                "names_matched": hits,
+                                "guessed": "no",
+                                "guess_reason": ""
+                            })
+                    else:
+                        # Evidence was insufficient: optionally guess
+                        if enable_fallback and uniq_names:
+                            # choose top-k guessing patterns (biased by any separators seen)
+                            guess_patterns = guess_top_patterns_for_domain(emls, top_k=fallback_top_k)
+                            reason = "no evidence; guessed via common patterns"
+                            # If any emails existed (on any route) with separators, say so:
+                            if emls:
+                                locs = {e.split("@",1)[0] for e in emls if "@" in e}
+                                seps = infer_separators_from_locals(locs)
+                                if seps:
+                                    reason = f"no matches; guessed using observed separator(s): {' '.join(sorted(seps))}"
+                            for pk in guess_patterns:
+                                for g in generate_emails(uniq_names, dom, pk):
+                                    gen_rows.append({
+                                        "domain": dom,
+                                        "pattern": pk,
+                                        "confidence": "0.00",
+                                        "name": g["name"],
+                                        "email": g["email"],
+                                        "evidence_emails_seen": len(emls),
+                                        "names_tested": tested,
+                                        "names_matched": hits,
+                                        "guessed": "yes",
+                                        "guess_reason": reason
+                                    })
+                        else:
+                            # record that we tried but aren't guessing
+                            gen_rows.append({
+                                "domain": dom,
+                                "pattern": "(insufficient evidence)",
+                                "confidence": f"{conf:.2f}",
+                                "name": "",
+                                "email": "",
+                                "evidence_emails_seen": len(emls),
+                                "names_tested": tested,
+                                "names_matched": hits,
+                                "guessed": "no",
+                                "guess_reason": ""
+                            })
+
+                    if gen_rows:
+                        append_rows_csv(
+                            PARTIAL_GEN_PARTIAL,
+                            gen_rows,
+                            ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"]
+                        )
+
                     state["done"] += 1
                     pbar.progress(state["done"] / max(total, 1))
                     status.markdown(f"**Processed {state['done']} of {total} domains**")
@@ -547,6 +702,7 @@ if file_buf:
         with st.spinner("Crawling and checking..."):
             asyncio.run(run_crawl())
 
+        # show final crawled emails (evidence-based) for just this run's bases
         final_rows = [r for r in read_rows_csv(PARTIAL_DOMAIN) if r.get("source","") in set(bases)]
         final_rows = dedupe_rows(final_rows, "email")
         if not final_rows:
@@ -558,94 +714,19 @@ if file_buf:
                                file_name="emails_found_checked.csv",
                                mime="text/csv")
 
-        # ===== Pattern inference + Top People generation =====
-        st.subheader("Pattern inference & Top People (experimental)")
-        want_generate = st.checkbox("Generate top 7 contacts per domain (infer pattern from site)", value=True)
-
-        if want_generate:
-            GEN_ROWS = []
-            people_paths = ["/about", "/team", "/leadership", "/company", "/staff"]
-            # Build an index of emails found per domain
-            emails_by_domain = {}
-            for r in final_rows:
-                try:
-                    dom = r.get("domain","").strip().lower()
-                    eml = r.get("email","").strip().lower()
-                    if dom and eml:
-                        emails_by_domain.setdefault(dom, set()).add(eml)
-                except Exception:
-                    pass
-
-            with st.spinner("Inferring patterns and generating contacts..."):
-                async def process_generation():
-                    async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
-                        for base in bases:
-                            b = base.rstrip("/")
-                            dom = urlparse(base).netloc.lower()
-                            # gather names from likely pages
-                            names_pool = []
-                            for pth in people_paths:
-                                try:
-                                    html = await run_with_timeout(fetch(client, f"{b}{pth}"), seconds=10)
-                                    if not html:
-                                        continue
-                                    names_pool.extend(extract_candidate_names(html))
-                                    if len(names_pool) >= 40:
-                                        break
-                                except Exception:
-                                    continue
-                            # pick top 7 unique names by first occurrence
-                            seen = set()
-                            uniq_names = []
-                            for nm in names_pool:
-                                key = nm.lower()
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                uniq_names.append(nm)
-                                if len(uniq_names) >= 7:
-                                    break
-
-                            found_emails = emails_by_domain.get(dom, set())
-                            pattern, conf, hits, tested = infer_pattern_for_domain(dom, found_emails, uniq_names)
-
-                            if pattern and conf >= 0.34 and uniq_names:
-                                generated = generate_emails(uniq_names, dom, pattern)
-                                for g in generated:
-                                    GEN_ROWS.append({
-                                        "domain": dom,
-                                        "pattern": pattern,
-                                        "confidence": f"{conf:.2f}",
-                                        "name": g["name"],
-                                        "email": g["email"],
-                                        "evidence_emails_seen": len(found_emails),
-                                        "names_tested": tested,
-                                        "names_matched": hits
-                                    })
-                            else:
-                                GEN_ROWS.append({
-                                    "domain": dom,
-                                    "pattern": "(insufficient evidence)",
-                                    "confidence": f"{conf:.2f}",
-                                    "name": "",
-                                    "email": "",
-                                    "evidence_emails_seen": len(found_emails),
-                                    "names_tested": tested,
-                                    "names_matched": hits
-                                })
-                asyncio.run(process_generation())
-
-            if GEN_ROWS:
-                st.write("We only generate when we have evidence from that company's real emails. No evidence ⇒ no guessing.")
-                st.dataframe(GEN_ROWS, use_container_width=True)
-                st.download_button(
-                    "Download generated contacts CSV",
-                    list_to_csv_bytes(GEN_ROWS, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched"]),
-                    file_name="generated_contacts.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No patterns inferred yet. Try more pages per domain or include more domains with visible emails.")
+        # show generated contacts partial (evidence-based + guesses if enabled)
+        gen_rows_now = read_rows_csv(PARTIAL_GEN_PARTIAL)
+        if gen_rows_now:
+            st.subheader("Generated contacts (evidence-based and/or guesses)")
+            st.dataframe(gen_rows_now, use_container_width=True)
+            st.download_button(
+                "Download generated contacts CSV",
+                list_to_csv_bytes(gen_rows_now, ["domain","pattern","confidence","name","email","evidence_emails_seen","names_tested","names_matched","guessed","guess_reason"]),
+                file_name="generated_contacts.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No generated contacts yet.")
 
     # ===== SPECIFIC URL SCAN MODE =====
     elif "url" in cols:
